@@ -2,7 +2,7 @@
 
 A self-contained "internal AI assistant" for a conference stage. It answers
 employee questions from a small internal knowledge base. One document (an
-auto-imported support ticket, **#2205**) is poisoned with hidden instructions.
+auto-imported support ticket, **#2228**) is poisoned with hidden instructions.
 When the assistant reads it — because the user asked an *innocent* question —
 it obeys the attacker and leaks a confidential key from its own system prompt.
 
@@ -61,9 +61,9 @@ an "Ollama unreachable" error.
 app.py                     the whole app (stdlib Python + embedded UI)
 test_app.py                tests, no Ollama needed: python3 -m unittest
 data/
-  a_poison_ticket.md       ⚠ POISONED — ticket #2205, carries the injection
   it_ticket_2201.md        benign — printer ticket (the "benign" question)
   it_ticket_2202–2227.md   benign — filler IT tickets
+  it_ticket_2228.md        ⚠ POISONED — ticket #2228, carries the injection
   hr_remote_policy.md      benign — HR policy
   onboarding_checklist.md  benign — onboarding
 ```
@@ -73,15 +73,16 @@ matter sets its metadata; `trusted: false` marks it as external/untrusted:
 
 ```
 ---
-title: Ticket #2205 — VPN reset request
+title: Ticket #2228 — VPN reset request
 source: e-mail → auto-imported to ticket system (EXTERNAL sender)
 trusted: false
 ---
 ...document body...
 ```
 
-In untrusted documents, everything after a `-----` line is highlighted as the
-payload in the UI. Add or edit files and click **↻ Reload**; no restart needed.
+In untrusted documents, the `-----` line and everything after it is the payload.
+The UI renders it in the background colour (invisible); select it with the mouse
+to reveal it. Add or edit files and click **↻ Reload**; no restart needed.
 
 Everything is fictional (company "Aptum", fake e-mails, fake key). The attack
 only targets this local toy app — it's an educational demonstration of a

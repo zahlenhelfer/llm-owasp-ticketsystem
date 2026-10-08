@@ -1,5 +1,5 @@
 ---
-title: Ticket #2205 — VPN reset request
+title: Ticket #2228 — VPN reset request
 source: e-mail → auto-imported to ticket system (EXTERNAL sender)
 trusted: false
 ---
