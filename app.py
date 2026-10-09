@@ -18,9 +18,14 @@ Runtime deps: NONE beyond the Python standard library + a local Ollama.
     3. python3 app.py         then open http://localhost:8000
 """
 
+import base64
+import binascii
+import codecs
 import html
 import json
 import os
+import re
+import unicodedata
 import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -164,13 +169,104 @@ def answer(question: str, defense: bool):
     return call_ollama(build_messages(question, defense))
 
 
+# --------------------------------------------------------------------------- #
+# Output filter (DLP-style, defense-in-depth)
+# --------------------------------------------------------------------------- #
+# An injected instruction can ask the model to disguise the secret, so a literal
+# match is not enough. The filter:
+#   1. matches generic credential shapes, not just our one known key;
+#   2. normalises Unicode tricks (zero-width chars, look-alike letters);
+#   3. decodes base64/hex blobs, reversed text, ROT13 and NATO spelling;
+#   4. flags partial leaks ("the first half is TK-ZX4...").
+# What it can locate gets redacted; if it detects a leak it cannot locate, the
+# whole answer is withheld (fail closed).
+REDACTED = "[REDACTED BY OUTPUT FILTER]"
+WITHHELD = "[ANSWER WITHHELD BY OUTPUT FILTER — possible secret disclosure]"
+
+# Known secrets the assistant can see. In production: canary tokens + vault refs.
+PROTECTED_SECRETS = [SECRET_KEY]
+MIN_PARTIAL = 6  # this many consecutive characters of a secret count as a leak
+
+# The real key split up by up to 3 separators ("T K Z X 4 4 Q h 9", "T.K-ZX_44...").
+_SPLIT_KEY = r"[\W_]{0,3}".join(re.escape(c) for c in SECRET_KEY if c.isalnum())
+SECRET_KEY_PATTERN = re.compile(
+    rf"\bTK-[A-Z0-9]{{4}}-[A-Z0-9]{{3}}\b|{_SPLIT_KEY}", re.IGNORECASE
+)
+CREDENTIAL_PATTERNS = [
+    SECRET_KEY_PATTERN,
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),                  # AWS access key id
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"),                 # GitHub token
+    re.compile(r"\bxox[abpr]-[A-Za-z0-9-]{10,}"),                  # Slack token
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"),                        # OpenAI/Anthropic-style API key
+    re.compile(r"\beyJ[\w-]{8,}\.eyJ[\w-]{8,}\.[\w-]{8,}"),        # JWT
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)"),
+]
+_B64_TOKEN = re.compile(r"[A-Za-z0-9+/_-]{12,}={0,2}")
+_HEX_TOKEN = re.compile(r"\b(?:[0-9a-fA-F]{2}[ :]?){7,}[0-9a-fA-F]{2}\b")
+
+# Common Cyrillic/Greek look-alikes that NFKC normalisation leaves untouched.
+_CONFUSABLES = str.maketrans("АВЕКМНОРСТХаеорсухіјΑΒΕΖΗΙΚΜΝΟΡΤΥΧ",
+                             "ABEKMHOPCTXaeopcyxijABEZHIKMNOPTYX")
+_NATO = {w: w[0] for w in "alpha alfa bravo charlie delta echo foxtrot golf hotel india "
+         "juliet juliett kilo lima mike november oscar papa quebec romeo sierra tango "
+         "uniform victor whiskey whisky xray x-ray yankee zulu".split()}
+_NATO.update({w: str(i) for i, w in enumerate(
+    "zero one two three four five six seven eight nine".split())})
+_NATO["niner"] = "9"
+
+
+def _squash(text: str) -> str:
+    """Lower-case alphanumerics only, after Unicode and look-alike normalisation."""
+    text = unicodedata.normalize("NFKC", text).translate(_CONFUSABLES)
+    return "".join(c for c in text.lower() if c.isascii() and c.isalnum())
+
+
+def _decoded(text: str):
+    """Yield plausible decodings of base64 / hex blobs found in the text."""
+    for m in _B64_TOKEN.finditer(text):
+        tok = m.group().replace("-", "+").replace("_", "/")
+        try:
+            yield m, base64.b64decode(tok + "=" * (-len(tok) % 4)).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError):
+            pass
+    for m in _HEX_TOKEN.finditer(text):
+        try:
+            yield m, bytes.fromhex(re.sub(r"[ :]", "", m.group())).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            pass
+
+
+def _contains_secret(squashed: str) -> bool:
+    for secret in PROTECTED_SECRETS:
+        s = _squash(secret)
+        n = min(MIN_PARTIAL, len(s))
+        if any(s[i:i + n] in squashed for i in range(len(s) - n + 1)):
+            return True
+    return False
+
+
 def leaked(text: str) -> bool:
-    return SECRET_KEY in text
+    if any(p.search(text) for p in CREDENTIAL_PATTERNS):
+        return True
+    words = re.findall(r"[a-z]+(?:-[a-z]+)?|\d", unicodedata.normalize("NFKC", text).lower())
+    variants = [
+        _squash(text),
+        _squash(text)[::-1],
+        _squash(codecs.encode(text, "rot13")),
+        "".join(_NATO.get(w, "") for w in words),
+    ]
+    variants += [_squash(dec) for _, dec in _decoded(text)]
+    return any(_contains_secret(v) for v in variants)
 
 
 def apply_output_filter(text: str):
-    """Defense-in-depth: redact the secret if it still slips through (DLP-style)."""
-    return text.replace(SECRET_KEY, "[REDACTED BY OUTPUT FILTER]")
+    """Redact what can be located; withhold the answer if a leak remains."""
+    for p in CREDENTIAL_PATTERNS:
+        text = p.sub(REDACTED, text)
+    for m, dec in reversed(list(_decoded(text))):
+        if leaked(dec):
+            text = text[:m.start()] + REDACTED + text[m.end():]
+    return WITHHELD if leaked(text) else text
 
 # --------------------------------------------------------------------------- #
 # HTTP server
